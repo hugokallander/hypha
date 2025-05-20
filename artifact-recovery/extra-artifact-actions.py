@@ -3,6 +3,7 @@ from datetime import datetime
 from sqlalchemy import select, text, or_, and_
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
 from artifact_model import ArtifactModel
+from sqlmodel import SQLModel
 from constants import DATABASE_URI, DATABASE_URL
 
 engine = create_async_engine(DATABASE_URI, echo=False)
@@ -730,6 +731,22 @@ async def minimal_pg_list_children_repro(parent_id: str, stage=None, limit=10):
 
 
 # stop using pg_engine_local from here
+
+
+async def drop_artifacts_table(pg_engine):
+    async with pg_engine.begin() as conn:
+        await conn.run_sync(
+            lambda conn: ArtifactModel.__table__.drop(conn, checkfirst=True)
+        )
+    print("🗑️ Dropped existing 'artifacts' table.")
+
+
+async def init_postgres_schema(pg_engine):
+    async with pg_engine.begin() as conn:
+        await conn.run_sync(
+            lambda conn: SQLModel.metadata.create_all(conn, checkfirst=True)
+        )
+    print("✅ PostgreSQL schema initialized.")
 
 
 async def debug_pg_schema():

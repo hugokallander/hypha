@@ -10,9 +10,10 @@ import os
 import json
 import asyncio
 import logging
+from collections import defaultdict, deque
 from pathlib import Path
 from botocore.config import Config
-from sqlalchemy import select
+from sqlalchemy import select, text
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
 from sqlmodel import SQLModel
 from aiobotocore.session import get_session
@@ -25,10 +26,10 @@ from constants import (
     ADDITIONAL_ENV_FILES,
     ADDITIONAL_ENV_KEYS,
     DATABASE_URI,
+    DB_USER_DEFAULT,
+    DB_NAME_DEFAULT,
+    DB_PORT_DEFAULT,
 )
-
-
-SQLModel.metadata.clear()
 
 
 # --- Load env ---
@@ -408,23 +409,7 @@ def get_additional_s3_sources(additional_env_files, additional_env_keys):
     return additional_s3_sources
 
 
-async def drop_artifacts_table():
-    async with pg_engine.begin() as conn:
-        await conn.run_sync(
-            lambda conn: ArtifactModel.__table__.drop(conn, checkfirst=True)
-        )
-    print("🗑️ Dropped existing 'artifacts' table.")
-
-
-async def init_postgres_schema():
-    async with pg_engine.begin() as conn:
-        await conn.run_sync(
-            lambda conn: SQLModel.metadata.create_all(conn, checkfirst=True)
-        )
-    print("✅ PostgreSQL schema initialized.")
-
-
-async def check_pg_table_rows():
+async def check_pg_table_rows(pg_engine):
     async with pg_engine.begin() as conn:
         result = await conn.execute(text("SELECT COUNT(*) FROM artifacts"))
         count = result.scalar()
@@ -484,7 +469,7 @@ def topological_sort_artifacts(artifacts):
     return ordered
 
 
-async def transfer_artifacts_topo():
+async def transfer_artifacts_topo(pg_engine, sqlite_session_maker, pg_session_maker):
     async with sqlite_session_maker() as sqlite_session:
         result = await sqlite_session.exec(select(ArtifactModel))
         all_artifacts = result.all()
@@ -507,22 +492,41 @@ async def transfer_artifacts_topo():
         await pg_session.commit()
 
     print(f"✅ Inserted {inserted}/{len(all_artifacts)}")
-    await check_pg_table_rows()
+    await check_pg_table_rows(pg_engine)
 
 
 async def main():
+    SQLModel.metadata.clear()
+
     env_vars = load_env_file(ENV_FILE) if Path(ENV_FILE).exists() else {}
     s3_config = get_s3_config(env_vars)
     additional_s3_sources = get_additional_s3_sources(
         ADDITIONAL_ENV_FILES, ADDITIONAL_ENV_KEYS
     )
+
     await rebuild_database(s3_config, additional_s3_sources)
+
     engine = create_async_engine(DATABASE_URI, echo=False)
     sqlite_session_maker = async_sessionmaker(
         engine, class_=AsyncSession, expire_on_commit=False
     )
+
     await remove_orphan_artifacts(sqlite_session_maker)
-    await transfer_artifacts_topo()
+    db_password = env_vars.get("DB_PASSWORD", "")
+    db_host = env_vars.get("DB_HOST", "")
+    db_user = env_vars.get("DB_USER", DB_USER_DEFAULT)
+    db_port = env_vars.get("DB_PORT", DB_PORT_DEFAULT)
+    db_name = env_vars.get("DB_NAME", DB_NAME_DEFAULT)
+
+    database_url = (
+        f"postgresql+asyncpg://{db_user}:{db_password}@{db_host}:{db_port}/{db_name}"
+    )
+    pg_engine = create_async_engine(database_url, echo=False)
+    pg_session_maker = async_sessionmaker(
+        pg_engine, expire_on_commit=False, class_=AsyncSession
+    )
+
+    await transfer_artifacts_topo(pg_engine, sqlite_session_maker, pg_session_maker)
 
 
 if __name__ == "__main__":
