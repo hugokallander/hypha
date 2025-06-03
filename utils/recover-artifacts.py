@@ -10,6 +10,7 @@ import os
 import json
 import asyncio
 import logging
+import argparse
 from collections import defaultdict, deque
 from pathlib import Path
 from botocore.config import Config
@@ -30,6 +31,9 @@ from utils.constants import (
     DB_NAME_DEFAULT,
     DB_PORT_DEFAULT,
 )
+
+# Global dry run flag
+DRY_RUN = False
 
 
 # --- Load env ---
@@ -54,9 +58,11 @@ if not logger.handlers:
     )
     logger.addHandler(handler)
 
-if os.path.exists(DATABASE_PATH):
+if not DRY_RUN and os.path.exists(DATABASE_PATH):
     os.remove(DATABASE_PATH)
     logger.info("Removed existing database at %s", DATABASE_PATH)
+elif DRY_RUN and os.path.exists(DATABASE_PATH):
+    logger.info("[DRY RUN] Would remove existing database at %s", DATABASE_PATH)
 
 
 def safe_join(directory, *pathnames):
@@ -118,6 +124,9 @@ async def list_objects_async(s3_client, bucket, prefix=None, delimiter="/"):
 
 
 async def init_db(engine):
+    if DRY_RUN:
+        logger.info("[DRY RUN] Would initialize database tables")
+        return
     async with engine.begin() as conn:
         await conn.run_sync(SQLModel.metadata.create_all)
 
@@ -262,8 +271,9 @@ async def rebuild_database(s3_config, additional_s3_sources):
         artifacts_by_id.update(artifacts)
 
     logger.info(
-        "Total artifacts collected: %d. Inserting into database...",
+        "Total artifacts collected: %d. %s into database...",
         len(artifacts_by_id),
+        "Would insert" if DRY_RUN else "Inserting",
     )
 
     inserted = 0
@@ -271,74 +281,97 @@ async def rebuild_database(s3_config, additional_s3_sources):
     overwritten = 0
     failed = 0
 
-    async with session_maker() as session:
+    if DRY_RUN:
+        # In dry run mode, just log what would be done
         for artifact_id, artifact_data in artifacts_by_id.items():
-            try:
-                async with session.begin():
-                    alias = artifact_data.get("alias")
-                    ws = artifact_data.get("workspace")
-                    if alias:
-                        stmt = select(ArtifactModel).where(
-                            ArtifactModel.workspace == ws, ArtifactModel.alias == alias
+            alias = artifact_data.get("alias")
+            ws = artifact_data.get("workspace")
+
+            logger.info(
+                "[DRY RUN] Would insert artifact: %s, alias: %s, workspace: %s, file_count: %s, created_at: %s, created_by: %s, last_modified: %s",
+                artifact_id,
+                alias,
+                ws,
+                artifact_data.get("file_count"),
+                artifact_data.get("created_at"),
+                artifact_data.get("created_by"),
+                artifact_data.get("last_modified"),
+            )
+            inserted += 1
+    else:
+        # Actual database operations
+        async with session_maker() as session:
+            for artifact_id, artifact_data in artifacts_by_id.items():
+                try:
+                    async with session.begin():
+                        alias = artifact_data.get("alias")
+                        ws = artifact_data.get("workspace")
+                        if alias:
+                            stmt = select(ArtifactModel).where(
+                                ArtifactModel.workspace == ws,
+                                ArtifactModel.alias == alias,
+                            )
+                            result = await session.execute(stmt)
+                            existing_artifact = result.scalar_one_or_none()
+
+                            if existing_artifact:
+                                s3_time = artifact_data.get("last_modified", 0)
+                                db_time = existing_artifact.last_modified or 0
+
+                                if s3_time > db_time:
+                                    logger.warning(
+                                        "Duplicate alias found for workspace='%s', alias='%s' — S3 artifact is NEWER (S3: %s, DB: %s). Overwriting.\n"
+                                        "→ S3 created_at: %s, file_count: %s\n"
+                                        "→ DB created_at: %s, file_count: %s",
+                                        ws,
+                                        alias,
+                                        s3_time,
+                                        db_time,
+                                        artifact_data.get("created_at"),
+                                        artifact_data.get("file_count"),
+                                        existing_artifact.created_at,
+                                        existing_artifact.file_count,
+                                    )
+                                    await session.delete(existing_artifact)
+                                    await session.flush()
+                                    overwritten += 1
+                                else:
+                                    logger.warning(
+                                        "Duplicate alias found for workspace='%s', alias='%s' — S3 artifact is OLDER (S3: %s, DB: %s). Skipping.\n"
+                                        "→ S3 created_at: %s, file_count: %s\n"
+                                        "→ DB created_at: %s, file_count: %s",
+                                        ws,
+                                        alias,
+                                        s3_time,
+                                        db_time,
+                                        artifact_data.get("created_at"),
+                                        artifact_data.get("file_count"),
+                                        existing_artifact.created_at,
+                                        existing_artifact.file_count,
+                                    )
+                                    skipped += 1
+                                    continue
+
+                        artifact = ArtifactModel(**artifact_data)
+                        session.add(artifact)
+                        inserted += 1
+                        logger.info(
+                            "Inserted artifact: %s, alias: %s, workspace: %s, file_count: %s, created_at: %s, created_by: %s, last_modified: %s",
+                            artifact.id,
+                            artifact.alias,
+                            artifact.workspace,
+                            artifact.file_count,
+                            artifact.created_at,
+                            artifact.created_by,
+                            artifact.last_modified,
                         )
-                        result = await session.execute(stmt)
-                        existing_artifact = result.scalar_one_or_none()
-
-                        if existing_artifact:
-                            s3_time = artifact_data.get("last_modified", 0)
-                            db_time = existing_artifact.last_modified or 0
-
-                            if s3_time > db_time:
-                                logger.warning(
-                                    "Duplicate alias found for workspace='%s', alias='%s' — S3 artifact is NEWER (S3: %s, DB: %s). Overwriting.\n"
-                                    "→ S3 created_at: %s, file_count: %s\n"
-                                    "→ DB created_at: %s, file_count: %s",
-                                    ws,
-                                    alias,
-                                    s3_time,
-                                    db_time,
-                                    artifact_data.get("created_at"),
-                                    artifact_data.get("file_count"),
-                                    existing_artifact.created_at,
-                                    existing_artifact.file_count,
-                                )
-                                await session.delete(existing_artifact)
-                                await session.flush()
-                                logger.warning(
-                                    "Duplicate alias found for workspace='%s', alias='%s' — S3 artifact is OLDER (S3: %s, DB: %s). Skipping.\n"
-                                    "→ S3 created_at: %s, file_count: %s\n"
-                                    "→ DB created_at: %s, file_count: %s",
-                                    ws,
-                                    alias,
-                                    s3_time,
-                                    db_time,
-                                    artifact_data.get("created_at"),
-                                    artifact_data.get("file_count"),
-                                    existing_artifact.created_at,
-                                    existing_artifact.file_count,
-                                )
-                                skipped += 1
-                                continue
-
-                    artifact = ArtifactModel(**artifact_data)
-                    session.add(artifact)
-                    inserted += 1
-                    logger.info(
-                        "Inserted artifact: %s, alias: %s, workspace: %s, file_count: %s, created_at: %s, created_by: %s, last_modified: %s",
-                        artifact.id,
-                        artifact.alias,
-                        artifact.workspace,
-                        artifact.file_count,
-                        artifact.created_at,
-                        artifact.created_by,
-                        artifact.last_modified,
-                    )
-            except Exception as e:
-                logger.error("Insert error for artifact %s: %s", artifact_id, e)
-                failed += 1
+                except Exception as e:
+                    logger.error("Insert error for artifact %s: %s", artifact_id, e)
+                    failed += 1
 
     logger.info(
-        "Database recovery completed. Inserted: %d, Overwritten: %d, Skipped: %d, Failed: %d",
+        "Database recovery completed. %s: %d, Overwritten: %d, Skipped: %d, Failed: %d",
+        "Would insert" if DRY_RUN else "Inserted",
         inserted,
         overwritten,
         skipped,
@@ -347,6 +380,10 @@ async def rebuild_database(s3_config, additional_s3_sources):
 
 
 async def remove_orphan_artifacts(session_maker):
+    if DRY_RUN:
+        logger.info("[DRY RUN] Would scan for orphan artifacts to remove")
+        return
+
     async with session_maker() as session:
         result = await session.execute(select(ArtifactModel))
         all_artifacts = result.all()
@@ -470,6 +507,10 @@ def topological_sort_artifacts(artifacts):
 
 
 async def transfer_artifacts_topo(pg_engine, sqlite_session_maker, pg_session_maker):
+    if DRY_RUN:
+        print("🔄 [DRY RUN] Would transfer artifacts with topological ordering")
+        return
+
     async with sqlite_session_maker() as sqlite_session:
         result = await sqlite_session.exec(select(ArtifactModel))
         all_artifacts = result.all()
@@ -496,6 +537,24 @@ async def transfer_artifacts_topo(pg_engine, sqlite_session_maker, pg_session_ma
 
 
 async def main():
+    global DRY_RUN
+
+    # Parse command line arguments
+    parser = argparse.ArgumentParser(
+        description="Hypha Database Recovery Script - Rebuild SQLite database from S3 backups"
+    )
+    parser.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="Show what would be done without actually making changes",
+    )
+    args = parser.parse_args()
+
+    DRY_RUN = args.dry_run
+
+    if DRY_RUN:
+        logger.info("🔍 DRY RUN MODE: No changes will be made to the database")
+
     SQLModel.metadata.clear()
 
     env_vars = load_env_file(ENV_FILE) if Path(ENV_FILE).exists() else {}
@@ -506,28 +565,39 @@ async def main():
 
     await rebuild_database(s3_config, additional_s3_sources)
 
-    engine = create_async_engine(DATABASE_URI, echo=False)
-    sqlite_session_maker = async_sessionmaker(
-        engine, class_=AsyncSession, expire_on_commit=False
-    )
+    if not DRY_RUN:
+        engine = create_async_engine(DATABASE_URI, echo=False)
+        sqlite_session_maker = async_sessionmaker(
+            engine, class_=AsyncSession, expire_on_commit=False
+        )
 
-    await remove_orphan_artifacts(sqlite_session_maker)
-    db_password = env_vars.get("DB_PASSWORD", "")
-    db_host = env_vars.get("DB_HOST", "")
-    db_user = env_vars.get("DB_USER", DB_USER_DEFAULT)
-    db_port = env_vars.get("DB_PORT", DB_PORT_DEFAULT)
-    db_name = env_vars.get("DB_NAME", DB_NAME_DEFAULT)
+        await remove_orphan_artifacts(sqlite_session_maker)
+        db_password = env_vars.get("DB_PASSWORD", "")
+        db_host = env_vars.get("DB_HOST", "")
+        db_user = env_vars.get("DB_USER", DB_USER_DEFAULT)
+        db_port = env_vars.get("DB_PORT", DB_PORT_DEFAULT)
+        db_name = env_vars.get("DB_NAME", DB_NAME_DEFAULT)
 
-    database_url = (
-        f"postgresql+asyncpg://{db_user}:{db_password}@{db_host}:{db_port}/{db_name}"
-    )
-    pg_engine = create_async_engine(database_url, echo=False)
-    pg_session_maker = async_sessionmaker(
-        pg_engine, expire_on_commit=False, class_=AsyncSession
-    )
+        database_url = f"postgresql+asyncpg://{db_user}:{db_password}@{db_host}:{db_port}/{db_name}"
+        pg_engine = create_async_engine(database_url, echo=False)
+        pg_session_maker = async_sessionmaker(
+            pg_engine, expire_on_commit=False, class_=AsyncSession
+        )
 
-    await transfer_artifacts_topo(pg_engine, sqlite_session_maker, pg_session_maker)
+        await transfer_artifacts_topo(pg_engine, sqlite_session_maker, pg_session_maker)
+    else:
+        logger.info("🔍 DRY RUN completed - no database operations were performed")
 
 
 if __name__ == "__main__":
+    parser = argparse.ArgumentParser(description="Hypha Database Recovery Script")
+    parser.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="Perform a trial run with no changes made",
+    )
+    args = parser.parse_args()
+
+    DRY_RUN = args.dry_run
+
     asyncio.run(main())
