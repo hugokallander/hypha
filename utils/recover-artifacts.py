@@ -17,8 +17,8 @@ from sqlalchemy import select, text
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
 from sqlmodel import SQLModel
 from aiobotocore.session import get_session
-from artifact_model import ArtifactModel
-from constants import (
+from utils.artifact_model import ArtifactModel
+from utils.constants import (
     ENV_FILE,
     DATABASE_PATH,
     LOGLEVEL,

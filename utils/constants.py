@@ -14,6 +14,7 @@ ADDITIONAL_ENV_KEYS = [
     "S3_BUCKET",
 ]
 DATABASE_URI = f"sqlite+aiosqlite:///{DATABASE_PATH}"
+DATABASE_URL = ""
 DB_USER_DEFAULT = "hypha-admin"
 DB_NAME_DEFAULT = "hypha-db"
 DB_PORT_DEFAULT = "5432"
